@@ -4,8 +4,8 @@ A multi-tool Streamlit application for image and file operations.
 
 Tools:
     1. HEIC -> JPG/PNG converter (max quality, batch supported)
-    2. iMessage Creator — generate a single iMessage bubble (sent or received)
-       on a transparent background, ready to paste onto any photo.
+    2. iMessage Creator — generate single iMessage bubbles (sent / received /
+       typing indicator) on a transparent background, ready to paste anywhere.
 """
 
 import io
@@ -43,7 +43,6 @@ FONT_DIR = Path(__file__).parent / "fonts"
 
 
 def _find_font(filenames: List[str]) -> str | None:
-    """Return the first font file that exists from a list of candidates."""
     for name in filenames:
         candidate = FONT_DIR / name
         if candidate.exists():
@@ -67,7 +66,6 @@ def _find_font(filenames: List[str]) -> str | None:
 
 
 def get_imessage_font(size: int) -> ImageFont.FreeTypeFont:
-    """Load the closest-to-SF-Pro font available."""
     candidates = [
         "SF-Pro-Text-Regular.otf", "SFProText-Regular.otf",
         "SFProDisplay-Regular.otf",
@@ -134,21 +132,14 @@ def heic_converter_tab() -> None:
                     if image.mode != "RGB":
                         image = image.convert("RGB")
                     image.save(
-                        buf,
-                        format="JPEG",
-                        quality=100,
-                        subsampling=0,
-                        optimize=True,
-                        exif=exif_bytes,
+                        buf, format="JPEG", quality=100, subsampling=0,
+                        optimize=True, exif=exif_bytes,
                     )
                     out_name = f"{stem}.jpg"
                     mime = "image/jpeg"
                 else:
                     image.save(
-                        buf,
-                        format="PNG",
-                        compress_level=6,
-                        optimize=True,
+                        buf, format="PNG", compress_level=6, optimize=True,
                     )
                     out_name = f"{stem}.png"
                     mime = "image/png"
@@ -165,7 +156,6 @@ def heic_converter_tab() -> None:
         if results:
             st.success(f"Converted {len(results)} file(s).")
 
-            # ZIP download — most convenient for batch
             if len(results) > 1:
                 import zipfile
                 zbuf = io.BytesIO()
@@ -198,12 +188,12 @@ def heic_converter_tab() -> None:
 # --------------------------------------------------------------------------- #
 
 # Authentic iMessage colors (sampled from iOS)
-IMSG_BLUE_TOP = (10, 132, 255)
-IMSG_BLUE_BOTTOM = (0, 122, 255)
+IMSG_BLUE = (10, 132, 255)
 IMSG_GRAY = (229, 229, 234)
 IMSG_TEXT_DARK = (0, 0, 0)
 IMSG_TEXT_LIGHT = (255, 255, 255)
 IMSG_DELIVERED_GRAY = (142, 142, 147)
+IMSG_TYPING_DOT = (140, 140, 145)
 
 
 def _wrap_text_to_width(
@@ -212,7 +202,7 @@ def _wrap_text_to_width(
     max_width: int,
     draw: ImageDraw.ImageDraw,
 ) -> List[str]:
-    """Wrap text so each line fits within max_width pixels."""
+    """Word-wrap respecting hard newlines."""
     lines: List[str] = []
     for paragraph in text.split("\n"):
         if not paragraph:
@@ -233,30 +223,129 @@ def _wrap_text_to_width(
     return lines
 
 
-def render_single_bubble(
-    text: str,
+# --------------------------------------------------------------------------- #
+# Bubble silhouette — the key to a correct iMessage look
+# --------------------------------------------------------------------------- #
+def _build_bubble_mask(
+    bubble_w: int,
+    bubble_h: int,
     *,
-    side: str,                          # "right" (blue/sent) or "left" (gray/received)
-    font_size: int = 64,
-    max_text_width_px: int = 900,
-    show_delivered: bool = True,        # ignored for "left"
+    side: str,
+    corner_radius: int,
+    tail_size: int,
+    canvas_w: int,
+    canvas_h: int,
+    bubble_x: int,
+    bubble_y: int,
 ) -> Image.Image:
     """
-    Render a single iMessage bubble on a transparent background.
-    Returns a tightly-cropped RGBA Image with full transparency outside
-    the bubble — ready to paste on any photo and rescale freely.
+    Build a single mask (L mode, 8-bit) representing the entire bubble
+    silhouette: rounded rectangle UNION a small tail curl on the bottom-
+    outer corner. Drawing the bubble fill through this mask is what gives
+    us the proper iMessage shape.
+
+    The tail is composed of:
+      * a primary rounded "lump" attached to the bottom-outer corner of
+        the bubble, formed by an ellipse that overlaps the bubble corner
+      * a tiny detached knob pixel further out (the iMessage "speech tail
+        end")
     """
-    # ---- Geometry — all proportional to font size -------------------------
+    mask = Image.new("L", (canvas_w, canvas_h), 0)
+    md = ImageDraw.Draw(mask)
+
+    # Main bubble rounded rectangle
+    md.rounded_rectangle(
+        [(bubble_x, bubble_y),
+         (bubble_x + bubble_w - 1, bubble_y + bubble_h - 1)],
+        radius=corner_radius,
+        fill=255,
+    )
+
+    # Tail — primary lump.
+    # Designed to attach seamlessly to the bottom-outer corner of the
+    # bubble and bulge outward + slightly downward, forming the iMessage
+    # "curl".
+    lump_d = int(tail_size * 1.7)        # diameter of the lump
+    knob_d = max(3, int(tail_size * 0.55))  # tiny separated knob
+
+    if side == "right":
+        # Lump: positioned so it overlaps the bubble's bottom-right corner.
+        # Its center sits roughly on the bubble's bottom edge, just outside
+        # the right edge.
+        lump_cx = bubble_x + bubble_w - int(corner_radius * 0.05)
+        lump_cy = bubble_y + bubble_h - int(lump_d * 0.45)
+        md.ellipse(
+            [(lump_cx - lump_d // 2, lump_cy - lump_d // 2),
+             (lump_cx + lump_d // 2, lump_cy + lump_d // 2)],
+            fill=255,
+        )
+        # Tiny knob — sits below-right of the lump, separated by transparent gap
+        knob_cx = bubble_x + bubble_w + int(tail_size * 0.55)
+        knob_cy = bubble_y + bubble_h + int(tail_size * 0.05)
+        md.ellipse(
+            [(knob_cx - knob_d // 2, knob_cy - knob_d // 2),
+             (knob_cx + knob_d // 2, knob_cy + knob_d // 2)],
+            fill=255,
+        )
+    else:
+        lump_cx = bubble_x + int(corner_radius * 0.05)
+        lump_cy = bubble_y + bubble_h - int(lump_d * 0.45)
+        md.ellipse(
+            [(lump_cx - lump_d // 2, lump_cy - lump_d // 2),
+             (lump_cx + lump_d // 2, lump_cy + lump_d // 2)],
+            fill=255,
+        )
+        knob_cx = bubble_x - int(tail_size * 0.55)
+        knob_cy = bubble_y + bubble_h + int(tail_size * 0.05)
+        md.ellipse(
+            [(knob_cx - knob_d // 2, knob_cy - knob_d // 2),
+             (knob_cx + knob_d // 2, knob_cy + knob_d // 2)],
+            fill=255,
+        )
+
+    return mask
+
+
+def _apply_subtle_blue_gradient(
+    base: Image.Image,
+    mask: Image.Image,
+    *,
+    color: Tuple[int, int, int],
+) -> None:
+    """Paint a flat color through the mask onto the base."""
+    fill_layer = Image.new("RGBA", base.size, color + (255,))
+    base.paste(fill_layer, (0, 0), mask)
+
+
+# --------------------------------------------------------------------------- #
+# Main bubble renderer
+# --------------------------------------------------------------------------- #
+def render_text_bubble(
+    text: str,
+    *,
+    side: str,                           # "right" (blue/sent) or "left" (gray/received)
+    font_size: int = 64,
+    max_text_width_px: int | None = None,
+    show_delivered: bool = True,
+) -> Image.Image:
+    """
+    Render a single iMessage text bubble on a transparent background.
+    Tightly cropped, returns RGBA. Padding / tail / radius all proportional
+    to font_size, so proportions stay correct at any size.
+    """
+    # ---- Geometry, all proportional to font ------------------------------
     pad_x = int(font_size * 0.55)
-    pad_y = int(font_size * 0.35)
+    pad_y = int(font_size * 0.30)
     line_spacing = int(font_size * 0.18)
-    tail_size = int(font_size * 0.40)
+    tail_size = int(font_size * 0.35)
 
-    # ---- Measure text first to figure out canvas size ---------------------
+    if max_text_width_px is None:
+        max_text_width_px = int(font_size * 14)  # sane default
+
     font = get_imessage_font(font_size)
-    delivered_font = get_imessage_font(max(12, int(font_size * 0.42)))
+    delivered_font = get_imessage_font(max(12, int(font_size * 0.40)))
 
-    # We need a draw context to measure — use a tiny scratch image
+    # ---- Measure text -----------------------------------------------------
     scratch = Image.new("RGBA", (1, 1))
     sdraw = ImageDraw.Draw(scratch)
 
@@ -276,222 +365,166 @@ def render_single_bubble(
 
     bubble_w = text_w + 2 * pad_x
     bubble_h = text_h + 2 * pad_y
-    corner_radius = min(bubble_h // 2, bubble_w // 2)
 
-    # ---- Compute canvas size with breathing room for tail + delivered ----
-    # The tail pokes out on the side, so we need extra width.
-    tail_pad = int(tail_size * 1.4)  # accommodates lobe + knob
+    # iMessage corner radius:
+    #   - small for tall/multi-line bubbles (rounded rectangle, ~18-22px in iOS at 1x)
+    #   - capped at half height for short single-line bubbles (pill shape)
+    # We use a fixed ratio of the FONT (not bubble height) so tall bubbles
+    # don't over-round, and cap by half-height so short bubbles can still be pill-shaped.
+    corner_radius = min(int(font_size * 0.95), bubble_h // 2)
+
+    # ---- Canvas size -----------------------------------------------------
     margin = max(2, int(font_size * 0.10))
+    tail_extra = int(tail_size * 1.6)  # room for lump + knob to extend past bubble
 
     delivered_h = 0
-    delivered_w_estimate = 0
     if side == "right" and show_delivered:
         dbbox = sdraw.textbbox((0, 0), "Delivered", font=delivered_font)
-        d_text_w = dbbox[2] - dbbox[0]
-        d_text_h = dbbox[3] - dbbox[1]
-        delivered_h = d_text_h + int(font_size * 0.30)
-        delivered_w_estimate = d_text_w  # we right-align under the bubble
+        delivered_h = (dbbox[3] - dbbox[1]) + int(font_size * 0.30)
 
-    canvas_w = bubble_w + tail_pad + 2 * margin
-    canvas_h = bubble_h + delivered_h + 2 * margin
+    canvas_w = bubble_w + tail_extra + 2 * margin
+    canvas_h = bubble_h + tail_extra + delivered_h + 2 * margin
 
-    # ---- Place bubble on the canvas --------------------------------------
     img = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
 
+    # Position bubble so the tail has room to extend on the OUTER side
     if side == "right":
-        # Bubble on the left side of the canvas; tail pokes right
-        bubble_x1 = margin
+        bubble_x = margin
     else:
-        # Bubble on the right side of the canvas; tail pokes left
-        bubble_x1 = margin + tail_pad
-    bubble_y1 = margin
-    bubble_x2 = bubble_x1 + bubble_w
-    bubble_y2 = bubble_y1 + bubble_h
+        bubble_x = margin + tail_extra
+    bubble_y = margin
 
-    # ---- Bubble fill ------------------------------------------------------
+    # ---- Build mask + paint ----------------------------------------------
+    mask = _build_bubble_mask(
+        bubble_w, bubble_h,
+        side=side,
+        corner_radius=corner_radius,
+        tail_size=tail_size,
+        canvas_w=canvas_w,
+        canvas_h=canvas_h,
+        bubble_x=bubble_x,
+        bubble_y=bubble_y,
+    )
+
     if side == "right":
-        # Blue gradient
-        grad = Image.new("RGBA", (bubble_w, bubble_h), IMSG_BLUE_BOTTOM + (255,))
-        gd = ImageDraw.Draw(grad)
-        for y in range(bubble_h):
-            t = y / max(1, bubble_h - 1)
-            r = int(IMSG_BLUE_TOP[0] * (1 - t) + IMSG_BLUE_BOTTOM[0] * t)
-            g = int(IMSG_BLUE_TOP[1] * (1 - t) + IMSG_BLUE_BOTTOM[1] * t)
-            b = int(IMSG_BLUE_TOP[2] * (1 - t) + IMSG_BLUE_BOTTOM[2] * t)
-            gd.line([(0, y), (bubble_w, y)], fill=(r, g, b, 255))
-        mask = Image.new("L", (bubble_w, bubble_h), 0)
-        ImageDraw.Draw(mask).rounded_rectangle(
-            [(0, 0), (bubble_w - 1, bubble_h - 1)],
-            radius=corner_radius,
-            fill=255,
-        )
-        img.paste(grad, (bubble_x1, bubble_y1), mask)
+        _apply_subtle_blue_gradient(img, mask, color=IMSG_BLUE)
         text_color = IMSG_TEXT_LIGHT
     else:
-        draw.rounded_rectangle(
-            [(bubble_x1, bubble_y1), (bubble_x2, bubble_y2)],
-            radius=corner_radius,
-            fill=IMSG_GRAY + (255,),
-        )
+        _apply_subtle_blue_gradient(img, mask, color=IMSG_GRAY)
         text_color = IMSG_TEXT_DARK
 
-    # ---- Tail (lobe + detached knob) --------------------------------------
-    tail_color = IMSG_BLUE_BOTTOM if side == "right" else IMSG_GRAY
-    lobe_w = int(tail_size * 1.4)
-    lobe_h = int(tail_size * 1.6)
-    knob_r = max(2, int(tail_size * 0.32))
-
-    if side == "right":
-        lobe_cx = bubble_x2 + int(tail_size * 0.2)
-        lobe_cy = bubble_y2 - int(lobe_h * 0.45)
-        draw.ellipse(
-            [(lobe_cx - lobe_w // 2, lobe_cy - lobe_h // 2),
-             (lobe_cx + lobe_w // 2, lobe_cy + lobe_h // 2)],
-            fill=tail_color + (255,),
-        )
-        knob_cx = bubble_x2 + int(tail_size * 0.95)
-        knob_cy = bubble_y2 - knob_r // 2
-        draw.ellipse(
-            [(knob_cx - knob_r, knob_cy - knob_r),
-             (knob_cx + knob_r, knob_cy + knob_r)],
-            fill=tail_color + (255,),
-        )
-    else:
-        lobe_cx = bubble_x1 - int(tail_size * 0.2)
-        lobe_cy = bubble_y2 - int(lobe_h * 0.45)
-        draw.ellipse(
-            [(lobe_cx - lobe_w // 2, lobe_cy - lobe_h // 2),
-             (lobe_cx + lobe_w // 2, lobe_cy + lobe_h // 2)],
-            fill=tail_color + (255,),
-        )
-        knob_cx = bubble_x1 - int(tail_size * 0.95)
-        knob_cy = bubble_y2 - knob_r // 2
-        draw.ellipse(
-            [(knob_cx - knob_r, knob_cy - knob_r),
-             (knob_cx + knob_r, knob_cy + knob_r)],
-            fill=tail_color + (255,),
-        )
-
-    # ---- Text -------------------------------------------------------------
-    ty = bubble_y1 + pad_y
+    # ---- Draw text -------------------------------------------------------
+    draw = ImageDraw.Draw(img)
+    ty = bubble_y + pad_y
     for ln in lines:
-        tx = bubble_x1 + pad_x
+        tx = bubble_x + pad_x
         draw.text((tx, ty), ln, font=font, fill=text_color + (255,))
         ty += line_h + line_spacing
 
-    # ---- "Delivered" — only for blue/sent bubbles -------------------------
+    # ---- "Delivered" — only on blue ---------------------------------------
     if side == "right" and show_delivered:
         dtext = "Delivered"
         dbbox = draw.textbbox((0, 0), dtext, font=delivered_font)
         dw = dbbox[2] - dbbox[0]
-        # Right-align under the bubble's right edge (matches iMessage)
-        dx = bubble_x2 - dw
-        dy = bubble_y2 + int(font_size * 0.25)
+        dx = bubble_x + bubble_w - dw
+        dy = bubble_y + bubble_h + int(font_size * 0.35)
         draw.text((dx, dy), dtext, font=delivered_font,
                   fill=IMSG_DELIVERED_GRAY + (255,))
 
-    # ---- Tight crop — remove all transparent margins ----------------------
-    # Get the alpha channel and find the bbox of non-transparent pixels.
+    return _tight_crop(img)
+
+
+def render_typing_bubble(
+    *,
+    font_size: int = 64,
+) -> Image.Image:
+    """
+    Render the iMessage typing indicator (gray bubble with three animated
+    dots — though we render a static frame). Returns RGBA, tightly cropped.
+
+    Uses the same geometry rules as a text bubble but sized around the dots
+    instead of text.
+    """
+    # The typing bubble in iMessage is roughly the size of a one-line gray
+    # bubble. We use font_size as a proxy for "scale".
+    pad_x = int(font_size * 0.55)
+    pad_y = int(font_size * 0.40)
+    tail_size = int(font_size * 0.35)
+
+    # Three dots, sized as a fraction of font size.
+    dot_d = int(font_size * 0.32)
+    dot_gap = int(dot_d * 0.55)
+
+    inner_w = 3 * dot_d + 2 * dot_gap
+    inner_h = dot_d
+
+    bubble_w = inner_w + 2 * pad_x
+    bubble_h = inner_h + 2 * pad_y
+
+    # Typing bubble is short — pill shape is correct
+    corner_radius = bubble_h // 2
+
+    margin = max(2, int(font_size * 0.10))
+    tail_extra = int(tail_size * 1.6)
+
+    canvas_w = bubble_w + tail_extra + 2 * margin
+    canvas_h = bubble_h + tail_extra + 2 * margin
+
+    img = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
+
+    # Typing bubble is always on the LEFT (received side) — the typing
+    # indicator only shows for the other person.
+    bubble_x = margin + tail_extra
+    bubble_y = margin
+
+    mask = _build_bubble_mask(
+        bubble_w, bubble_h,
+        side="left",
+        corner_radius=corner_radius,
+        tail_size=tail_size,
+        canvas_w=canvas_w,
+        canvas_h=canvas_h,
+        bubble_x=bubble_x,
+        bubble_y=bubble_y,
+    )
+
+    _apply_subtle_blue_gradient(img, mask, color=IMSG_GRAY)
+
+    # ---- Draw the three dots ---------------------------------------------
+    draw = ImageDraw.Draw(img)
+    dots_total_w = 3 * dot_d + 2 * dot_gap
+    start_x = bubble_x + (bubble_w - dots_total_w) // 2
+    cy = bubble_y + bubble_h // 2
+
+    for i in range(3):
+        cx = start_x + i * (dot_d + dot_gap) + dot_d // 2
+        draw.ellipse(
+            [(cx - dot_d // 2, cy - dot_d // 2),
+             (cx + dot_d // 2, cy + dot_d // 2)],
+            fill=IMSG_TYPING_DOT + (255,),
+        )
+
+    return _tight_crop(img)
+
+
+def _tight_crop(img: Image.Image) -> Image.Image:
+    """Crop to non-transparent bbox plus a 2-pixel safety margin."""
     alpha = img.split()[3]
     bbox = alpha.getbbox()
-    if bbox:
-        # Add a tiny safety margin so anti-aliased edges aren't clipped
-        safety = 2
-        x0 = max(0, bbox[0] - safety)
-        y0 = max(0, bbox[1] - safety)
-        x1 = min(canvas_w, bbox[2] + safety)
-        y1 = min(canvas_h, bbox[3] + safety)
-        img = img.crop((x0, y0, x1, y1))
-
-    return img
-
-
-def imessage_creator_tab() -> None:
-    st.header("iMessage Creator")
-    st.caption(
-        "Generate a single iMessage bubble on a transparent background. "
-        "Download as PNG, then paste it on any photo and rescale freely "
-        "in your editor (Photos, Photoshop, Canva, etc.)."
-    )
-
-    col1, col2 = st.columns([1, 1])
-    with col1:
-        side_label = st.radio(
-            "Bubble style",
-            options=["Sent (blue)", "Reply (gray)"],
-            horizontal=True,
-            help="Sent bubbles include 'Delivered' underneath. "
-                 "Reply bubbles do not (matches iMessage).",
-        )
-    with col2:
-        font_size = st.slider(
-            "Resolution (font size in px)",
-            min_value=32, max_value=160, value=72,
-            help="Higher = larger PNG, sharper when scaled. "
-                 "Doesn't affect final size — you'll resize on your photo anyway.",
-        )
-
-    side = "right" if side_label.startswith("Sent") else "left"
-
-    text = st.text_area(
-        "Message",
-        value="Can I call you back later? I'm at an appointment.",
-        height=80,
-        max_chars=500,
-    )
-
-    if not text.strip():
-        st.info("Type a message above to generate the bubble.")
-        return
-
-    # Render
-    bubble = render_single_bubble(
-        text=text,
-        side=side,
-        font_size=font_size,
-        show_delivered=(side == "right"),
-    )
-
-    st.divider()
-    st.markdown("**Preview** (transparent background — checkered pattern shows transparency)")
-
-    # Build a checkered preview background so transparency is visible
-    preview = _make_checkered_preview(bubble)
-    st.image(preview, use_container_width=False)
-
-    st.caption(
-        f"PNG size: {bubble.size[0]} × {bubble.size[1]}px · "
-        "Background is fully transparent."
-    )
-
-    # Download
-    buf = io.BytesIO()
-    bubble.save(buf, format="PNG", optimize=True)
-    st.download_button(
-        label="⬇️  Download bubble (PNG, transparent)",
-        data=buf.getvalue(),
-        file_name="imessage_bubble.png",
-        mime="image/png",
-        type="primary",
-        use_container_width=True,
-    )
-
-    with st.expander("How to use this on a photo"):
-        st.markdown(
-            "1. Click **Download bubble (PNG)** above.\n"
-            "2. Open your photo in any editor: **Photos** (iPhone/Mac), "
-            "**Photoshop**, **Canva**, **Pixelmator**, **GIMP**, etc.\n"
-            "3. Insert / drag the downloaded PNG onto your photo.\n"
-            "4. Resize and position it however you like — the background "
-            "stays transparent so only the bubble shows.\n\n"
-            "*Tip: on iPhone, open the PNG in **Photos** → tap **Share** → "
-            "**Copy Photo** → open your target photo in **Markup** → paste.*"
-        )
+    if not bbox:
+        return img
+    safety = 2
+    w, h = img.size
+    return img.crop((
+        max(0, bbox[0] - safety),
+        max(0, bbox[1] - safety),
+        min(w, bbox[2] + safety),
+        min(h, bbox[3] + safety),
+    ))
 
 
 def _make_checkered_preview(img: Image.Image, square: int = 12) -> Image.Image:
-    """Composite the image over a checkered pattern so transparency is visible."""
+    """Composite over a checker pattern so transparency is visible."""
     w, h = img.size
     bg = Image.new("RGBA", (w, h), (255, 255, 255, 255))
     draw = ImageDraw.Draw(bg)
@@ -505,6 +538,101 @@ def _make_checkered_preview(img: Image.Image, square: int = 12) -> Image.Image:
                 )
     bg.alpha_composite(img)
     return bg
+
+
+# --------------------------------------------------------------------------- #
+# iMessage Creator UI
+# --------------------------------------------------------------------------- #
+def imessage_creator_tab() -> None:
+    st.header("iMessage Creator")
+    st.caption(
+        "Generate a single iMessage element on a transparent background. "
+        "Download the PNG, then paste it on any photo and rescale freely "
+        "in your editor."
+    )
+
+    bubble_type = st.radio(
+        "Type",
+        options=["Sent (blue)", "Reply (gray)", "Typing… (3 dots)"],
+        horizontal=True,
+    )
+
+    font_size = st.slider(
+        "Resolution (size in px)",
+        min_value=32, max_value=200, value=80,
+        help="Higher = larger PNG, sharper when scaled. "
+             "You'll resize on your photo anyway, so just pick big enough.",
+    )
+
+    bubble: Image.Image | None = None
+    download_filename = "imessage_bubble.png"
+
+    if bubble_type == "Typing… (3 dots)":
+        bubble = render_typing_bubble(font_size=font_size)
+        download_filename = "imessage_typing.png"
+
+    else:
+        side = "right" if bubble_type.startswith("Sent") else "left"
+        default_text = (
+            "Can I call you back later? I'm at an appointment."
+            if side == "right" else "You know it!"
+        )
+        text = st.text_area(
+            "Message",
+            value=default_text,
+            height=80,
+            max_chars=500,
+        )
+        if not text.strip():
+            st.info("Type a message above to generate the bubble.")
+            return
+
+        bubble = render_text_bubble(
+            text=text,
+            side=side,
+            font_size=font_size,
+            show_delivered=(side == "right"),
+        )
+        download_filename = (
+            "imessage_sent.png" if side == "right" else "imessage_reply.png"
+        )
+
+    st.divider()
+    st.markdown(
+        "**Preview** — checkered background shows transparency "
+        "(it won't appear when you paste it on a photo)."
+    )
+
+    preview = _make_checkered_preview(bubble)
+    st.image(preview, use_container_width=False)
+
+    st.caption(
+        f"PNG size: {bubble.size[0]} × {bubble.size[1]}px · "
+        "Background fully transparent."
+    )
+
+    buf = io.BytesIO()
+    bubble.save(buf, format="PNG", optimize=True)
+    st.download_button(
+        label="⬇️  Download PNG (transparent)",
+        data=buf.getvalue(),
+        file_name=download_filename,
+        mime="image/png",
+        type="primary",
+        use_container_width=True,
+    )
+
+    with st.expander("How to use this on a photo"):
+        st.markdown(
+            "1. Click **Download PNG** above.\n"
+            "2. Open your photo in any editor: **Photos** (iPhone/Mac), "
+            "**Photoshop**, **Canva**, **Pixelmator**, **GIMP**, etc.\n"
+            "3. Insert / drag the downloaded PNG onto your photo.\n"
+            "4. Resize and position it however you like — the background "
+            "stays transparent so only the bubble shows.\n\n"
+            "*iPhone tip: open the PNG in **Photos** → tap **Share** → "
+            "**Copy Photo** → open your target photo in **Markup** → paste.*"
+        )
 
 
 # --------------------------------------------------------------------------- #
