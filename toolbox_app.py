@@ -30,7 +30,7 @@ except ImportError:
 st.set_page_config(
     page_title="Toolbox",
     page_icon="🧰",
-    layout="centered",
+    layout="wide",
     initial_sidebar_state="collapsed",
 )
 
@@ -43,12 +43,10 @@ FONT_DIR = Path(__file__).parent / "fonts"
 
 def _find_font(filenames: List[str]) -> str | None:
     """Return the first font file that exists from a list of candidates."""
-    # First, look in the bundled ./fonts directory
     for name in filenames:
         candidate = FONT_DIR / name
         if candidate.exists():
             return str(candidate)
-    # Fall back to common system locations (works on most Linux/macOS)
     system_dirs = [
         "/usr/share/fonts",
         "/usr/local/share/fonts",
@@ -68,13 +66,7 @@ def _find_font(filenames: List[str]) -> str | None:
 
 
 def get_imessage_font(size: int, weight: str = "regular") -> ImageFont.FreeTypeFont:
-    """
-    Load the closest-to-SF-Pro font available.
-    Priority:
-      1. Bundled SF Pro / SFPro-Text (if present in ./fonts)
-      2. Inter (Google Fonts) — modern, similar metrics
-      3. DejaVu Sans (always available on Streamlit Cloud / Linux)
-    """
+    """Load the closest-to-SF-Pro font available."""
     if weight == "bold":
         candidates = [
             "SF-Pro-Text-Bold.otf", "SFProText-Bold.otf", "SFProDisplay-Bold.otf",
@@ -127,14 +119,12 @@ def heic_converter_tab() -> None:
 
     if st.button("Convert", type="primary", use_container_width=True):
         progress = st.progress(0.0)
-        results: List[Tuple[str, bytes, str]] = []  # (filename, bytes, mime)
+        results: List[Tuple[str, bytes, str]] = []
 
         for i, up in enumerate(uploaded_files, start=1):
             try:
                 image = Image.open(up)
-                # Preserve EXIF if present
                 exif_bytes = image.info.get("exif", b"")
-
                 buf = io.BytesIO()
                 stem = Path(up.name).stem
 
@@ -144,18 +134,18 @@ def heic_converter_tab() -> None:
                     image.save(
                         buf,
                         format="JPEG",
-                        quality=100,           # maximum quality
-                        subsampling=0,         # 4:4:4, no chroma downsampling
+                        quality=100,
+                        subsampling=0,
                         optimize=True,
                         exif=exif_bytes,
                     )
                     out_name = f"{stem}.jpg"
                     mime = "image/jpeg"
-                else:  # PNG — lossless
+                else:
                     image.save(
                         buf,
                         format="PNG",
-                        compress_level=6,      # balanced; lossless either way
+                        compress_level=6,
                         optimize=True,
                     )
                     out_name = f"{stem}.png"
@@ -181,7 +171,6 @@ def heic_converter_tab() -> None:
                     use_container_width=True,
                 )
 
-            # Bundle as ZIP if more than one
             if len(results) > 1:
                 import zipfile
                 zbuf = io.BytesIO()
@@ -189,7 +178,7 @@ def heic_converter_tab() -> None:
                     for name, data, _ in results:
                         zf.writestr(name, data)
                 st.download_button(
-                    label=f"⬇️  Download all as ZIP",
+                    label="⬇️  Download all as ZIP",
                     data=zbuf.getvalue(),
                     file_name="converted.zip",
                     mime="application/zip",
@@ -203,9 +192,9 @@ def heic_converter_tab() -> None:
 # --------------------------------------------------------------------------- #
 
 # Authentic iMessage colors (sampled from iOS)
-IMSG_BLUE_TOP = (10, 132, 255)       # gradient top — sent bubble
-IMSG_BLUE_BOTTOM = (0, 122, 255)     # gradient bottom — sent bubble
-IMSG_GRAY = (229, 229, 234)          # received bubble
+IMSG_BLUE_TOP = (10, 132, 255)
+IMSG_BLUE_BOTTOM = (0, 122, 255)
+IMSG_GRAY = (229, 229, 234)
 IMSG_TEXT_DARK = (0, 0, 0)
 IMSG_TEXT_LIGHT = (255, 255, 255)
 IMSG_DELIVERED_GRAY = (142, 142, 147)
@@ -238,49 +227,73 @@ def _wrap_text_to_width(
     return lines
 
 
+def _draw_double_check(
+    draw: ImageDraw.ImageDraw,
+    *,
+    cx: int,
+    cy: int,
+    size: int,
+    color: Tuple[int, int, int],
+) -> int:
+    """Draw two overlapping blue checkmarks. Returns total width consumed."""
+    stroke = max(2, int(size * 0.16))
+    spacing = max(int(size * 0.42), stroke + 1)
+    total_w = size + spacing
+    for offset in (0, spacing):
+        x0 = cx + offset
+        draw.line(
+            [(x0, cy + size * 0.50),
+             (x0 + size * 0.30, cy + size * 0.85)],
+            fill=color + (255,), width=stroke,
+        )
+        draw.line(
+            [(x0 + size * 0.30, cy + size * 0.85),
+             (x0 + size * 0.95, cy + size * 0.10)],
+            fill=color + (255,), width=stroke,
+        )
+    return total_w
+
+
 def _draw_bubble(
     base: Image.Image,
     text: str,
     *,
-    side: str,                       # "left" or "right"
+    side: str,
     top_y: int,
+    x_offset: int,
     canvas_width: int,
     font: ImageFont.FreeTypeFont,
-    scale: float,
-) -> int:
+) -> Tuple[int, int, int]:
     """
-    Draw a single iMessage-style bubble onto `base`.
-    Returns the y-coordinate immediately below the drawn bubble.
+    Draw a single iMessage-style bubble.
+    Padding and tail size scale with the FONT, not the image. So the
+    bubble proportions stay correct regardless of font_size or image size.
+    Returns (bubble_y2, bubble_x2, bubble_y2).
     """
-    # Layout constants, scaled
-    side_margin = int(18 * scale)
-    bubble_padding_x = int(16 * scale)
-    bubble_padding_y = int(9 * scale)
-    line_spacing = int(4 * scale)
-    tail_size = int(11 * scale)
-    # Reserve room on the outer side so the tail doesn't get clipped
-    outer_reserve = tail_size + int(4 * scale)
+    font_size = font.size
+    bubble_padding_x = int(font_size * 0.55)
+    bubble_padding_y = int(font_size * 0.35)
+    line_spacing = int(font_size * 0.18)
+    tail_size = int(font_size * 0.40)
+    outer_reserve = tail_size + int(font_size * 0.20)
+    side_margin = int(font_size * 0.70)
+
     max_bubble_width = int(canvas_width * 0.72)
 
-    # Use a transparent overlay so bubbles can sit on any photo
     overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
 
-    # Wrap text
     inner_max_w = max_bubble_width - 2 * bubble_padding_x
     lines = _wrap_text_to_width(text, font, inner_max_w, draw)
     if not lines:
         lines = [""]
 
-    # Measure
-    line_heights: List[int] = []
-    line_widths: List[int] = []
+    line_widths = []
     for ln in lines:
         bbox = draw.textbbox((0, 0), ln if ln else " ", font=font)
         line_widths.append(bbox[2] - bbox[0])
-        line_heights.append(bbox[3] - bbox[1])
     text_w = max(line_widths) if line_widths else 0
-    # Use font ascent/descent for stable line height
+
     ascent, descent = font.getmetrics()
     line_h = ascent + descent
     text_h = line_h * len(lines) + line_spacing * (len(lines) - 1)
@@ -288,22 +301,18 @@ def _draw_bubble(
     bubble_w = text_w + 2 * bubble_padding_x
     bubble_h = text_h + 2 * bubble_padding_y
 
-    # iMessage corner radius is roughly half the bubble height (pill ends),
-    # capped so it never exceeds half the bubble width either.
     corner_radius = min(bubble_h // 2, bubble_w // 2)
 
-    # Position bubble — leave room on the outer side for the tail
     if side == "right":
-        bubble_x1 = canvas_width - side_margin - outer_reserve - bubble_w
+        bubble_x1 = canvas_width - side_margin - outer_reserve - bubble_w + x_offset
     else:
-        bubble_x1 = side_margin + outer_reserve
+        bubble_x1 = side_margin + outer_reserve + x_offset
     bubble_y1 = top_y
     bubble_x2 = bubble_x1 + bubble_w
     bubble_y2 = bubble_y1 + bubble_h
 
-    # ---- Bubble fill ------------------------------------------------------
+    # Fill
     if side == "right":
-        # Vertical gradient blue (subtle, matches iOS rendering on long bubbles)
         grad = Image.new("RGBA", (bubble_w, bubble_h), IMSG_BLUE_BOTTOM + (255,))
         gd = ImageDraw.Draw(grad)
         for y in range(bubble_h):
@@ -312,8 +321,6 @@ def _draw_bubble(
             g = int(IMSG_BLUE_TOP[1] * (1 - t) + IMSG_BLUE_BOTTOM[1] * t)
             b = int(IMSG_BLUE_TOP[2] * (1 - t) + IMSG_BLUE_BOTTOM[2] * t)
             gd.line([(0, y), (bubble_w, y)], fill=(r, g, b, 255))
-
-        # Mask for rounded rectangle
         mask = Image.new("L", (bubble_w, bubble_h), 0)
         ImageDraw.Draw(mask).rounded_rectangle(
             [(0, 0), (bubble_w - 1, bubble_h - 1)],
@@ -330,17 +337,13 @@ def _draw_bubble(
         )
         text_color = IMSG_TEXT_DARK
 
-    # ---- Bubble tail ------------------------------------------------------
-    # The iMessage tail is a small curved hook on the bottom-outer corner.
-    # We approximate it as an ellipse-shaped lobe that pokes out from the
-    # corner, plus a small detached "knob" further out for the classic look.
+    # Tail
     tail_color = IMSG_BLUE_BOTTOM if side == "right" else IMSG_GRAY
     lobe_w = int(tail_size * 1.4)
     lobe_h = int(tail_size * 1.6)
     knob_r = max(2, int(tail_size * 0.32))
 
     if side == "right":
-        # Lobe overlaps the bottom-right corner of the bubble
         lobe_cx = bubble_x2 + int(tail_size * 0.2)
         lobe_cy = bubble_y2 - int(lobe_h * 0.45)
         draw.ellipse(
@@ -348,7 +351,6 @@ def _draw_bubble(
              (lobe_cx + lobe_w // 2, lobe_cy + lobe_h // 2)],
             fill=tail_color + (255,),
         )
-        # Detached knob slightly further out and down
         knob_cx = bubble_x2 + int(tail_size * 0.95)
         knob_cy = bubble_y2 - knob_r // 2
         draw.ellipse(
@@ -372,80 +374,41 @@ def _draw_bubble(
             fill=tail_color + (255,),
         )
 
-    # ---- Text -------------------------------------------------------------
+    # Text
     ty = bubble_y1 + bubble_padding_y
-    for i, ln in enumerate(lines):
-        lw = line_widths[i]
-        if side == "right":
-            # Right-align inside bubble looks wrong; iMessage left-aligns text
-            tx = bubble_x1 + bubble_padding_x
-        else:
-            tx = bubble_x1 + bubble_padding_x
+    for ln in lines:
+        tx = bubble_x1 + bubble_padding_x
         draw.text((tx, ty), ln, font=font, fill=text_color + (255,))
         ty += line_h + line_spacing
 
-    # Composite overlay onto base
     base.alpha_composite(overlay)
 
-    return bubble_y2
-
-
-def _draw_double_check(
-    draw: ImageDraw.ImageDraw,
-    *,
-    cx: int,
-    cy: int,
-    size: int,
-    color: Tuple[int, int, int],
-) -> int:
-    """Draw two overlapping blue checkmarks (iMessage 'delivered'/read icon).
-    Returns the total width consumed."""
-    stroke = max(2, int(size * 0.16))
-    # In iMessage the two checks overlap by about half a check-width
-    spacing = max(int(size * 0.42), stroke + 1)
-    total_w = size + spacing
-    for offset in (0, spacing):
-        x0 = cx + offset
-        # Left stroke (down to bottom-mid)
-        draw.line(
-            [(x0, cy + size * 0.50),
-             (x0 + size * 0.30, cy + size * 0.85)],
-            fill=color + (255,), width=stroke,
-        )
-        # Right stroke (up to top-right)
-        draw.line(
-            [(x0 + size * 0.30, cy + size * 0.85),
-             (x0 + size * 0.95, cy + size * 0.10)],
-            fill=color + (255,), width=stroke,
-        )
-    return total_w
+    return bubble_y2, bubble_x2, bubble_y2
 
 
 def _draw_delivered(
     base: Image.Image,
     *,
     bottom_y: int,
-    canvas_width: int,
+    right_edge: int,
     font: ImageFont.FreeTypeFont,
-    scale: float,
 ) -> None:
-    """Draw the small 'Delivered ✓✓' indicator under the last sent bubble."""
-    side_margin = int(18 * scale)
-    text = "Delivered"
+    """Draw 'Delivered ✓✓' aligned to the right edge of the last sent bubble."""
     overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
 
+    text = "Delivered"
     bbox = draw.textbbox((0, 0), text, font=font)
     tw = bbox[2] - bbox[0]
     th = bbox[3] - bbox[1]
 
     check_size = int(th * 0.85)
-    check_gap = int(4 * scale)
+    check_gap = max(3, int(font.size * 0.18))
     check_w_estimate = check_size + int(check_size * 0.55)
 
     group_w = tw + check_gap + check_w_estimate
-    group_x = canvas_width - side_margin - group_w
-    ty = bottom_y + int(6 * scale)
+    group_x = right_edge - group_w
+    ty = bottom_y + int(font.size * 0.25)
 
     draw.text((group_x, ty), text, font=font, fill=IMSG_DELIVERED_GRAY + (255,))
     _draw_double_check(
@@ -459,151 +422,224 @@ def _draw_delivered(
     base.alpha_composite(overlay)
 
 
+def _ensure_messages_state() -> None:
+    if "imsg_messages" not in st.session_state:
+        st.session_state.imsg_messages = [
+            {"side": "left",  "text": "I had a dream about you last night",     "dx": 0, "dy": 0},
+            {"side": "right", "text": "Was I starting a task and ACTUALLY finishing it??", "dx": 0, "dy": 0},
+            {"side": "left",  "text": "No",                                     "dx": 0, "dy": 0},
+            {"side": "right", "text": "Wasn't me",                              "dx": 0, "dy": 0},
+        ]
+
+
 def imessage_overlay_tab() -> None:
     st.header("iMessage Overlay")
-    st.caption("Drop your photo, write the conversation, position it, export.")
+    st.caption("Drop your photo, edit each message, position them individually, export.")
 
-    uploaded = st.file_uploader(
-        "Background photo",
-        type=["jpg", "jpeg", "png", "webp"],
-        key="imsg_uploader",
-    )
+    _ensure_messages_state()
 
-    st.markdown("**Conversation**")
-    st.caption(
-        "One message per line. Prefix with `>` for a sent (blue) message, "
-        "or leave plain for a received (gray) message."
-    )
-    default_convo = (
-        "I had a dream about you last night\n"
-        "> Was I starting a task and ACTUALLY finishing it??\n"
-        "No\n"
-        "> Wasn't me"
-    )
-    convo_text = st.text_area(
-        "Messages",
-        value=default_convo,
-        height=160,
-        label_visibility="collapsed",
-    )
+    left_col, right_col = st.columns([1, 1])
 
-    col1, col2 = st.columns(2)
-    with col1:
-        vertical_pos = st.slider(
-            "Vertical position",
-            min_value=0,
-            max_value=100,
-            value=30,
-            help="Where the conversation block starts (0 = top, 100 = bottom).",
-        )
-    with col2:
-        bubble_scale = st.slider(
-            "Bubble size",
-            min_value=0.5,
-            max_value=2.0,
-            value=1.0,
-            step=0.05,
+    # ============== LEFT — controls ========================================
+    with left_col:
+        uploaded = st.file_uploader(
+            "Background photo",
+            type=["jpg", "jpeg", "png", "webp"],
+            key="imsg_uploader",
         )
 
-    show_delivered = st.checkbox("Show 'Delivered' under the last sent message", value=True)
+        if not uploaded:
+            st.info("Upload a background photo to start.")
+            return
 
-    if not uploaded:
-        st.info("Upload a background photo to start.")
-        return
+        base_preview = Image.open(uploaded).convert("RGBA")
+        W, H = base_preview.size
 
-    # Load base image
-    base = Image.open(uploaded).convert("RGBA")
-    canvas_width, canvas_height = base.size
+        st.markdown("### Global settings")
 
-    # Choose a base font size proportional to image width, then apply scale.
-    base_font_size = max(14, int(canvas_width * 0.032))
-    font_size = int(base_font_size * bubble_scale)
-    font = get_imessage_font(font_size)
-    delivered_font = get_imessage_font(max(10, int(font_size * 0.62)))
-
-    # Parse conversation
-    messages: List[Tuple[str, str]] = []  # (side, text)
-    for raw in convo_text.split("\n"):
-        if not raw.strip():
-            continue
-        if raw.lstrip().startswith(">"):
-            messages.append(("right", raw.lstrip()[1:].lstrip()))
-        else:
-            messages.append(("left", raw))
-
-    if not messages:
-        st.warning("Add at least one message.")
-        return
-
-    # Estimate where to start drawing (vertical_pos is % from top)
-    starting_y = int(canvas_height * vertical_pos / 100)
-    # Clamp so bubbles don't start so low they get cut off (rough estimate)
-    estimated_block_height = len(messages) * int(font_size * 3.0)
-    if starting_y + estimated_block_height > canvas_height:
-        starting_y = max(0, canvas_height - estimated_block_height - int(40 * bubble_scale))
-
-    # Draw all bubbles
-    cursor_y = starting_y
-    last_right_bottom = None
-    bubble_gap = int(font_size * 0.55)
-
-    for side, msg in messages:
-        cursor_y = _draw_bubble(
-            base,
-            msg,
-            side=side,
-            top_y=cursor_y,
-            canvas_width=canvas_width,
-            font=font,
-            scale=bubble_scale,
+        default_font_size = max(28, int(W * 0.038))
+        font_size = st.slider(
+            "Bubble / font size (px)",
+            min_value=14,
+            max_value=200,
+            value=default_font_size,
+            help="Padding and tail scale automatically with the font, "
+                 "so bubble proportions stay correct.",
         )
-        if side == "right":
-            last_right_bottom = cursor_y
-        cursor_y += bubble_gap
 
-    # Delivered indicator under the last sent (right) bubble
-    if show_delivered and last_right_bottom is not None:
-        # Only show if the LAST message overall is a sent one (matches iMessage)
-        if messages[-1][0] == "right":
-            _draw_delivered(
-                base,
-                bottom_y=last_right_bottom,
-                canvas_width=canvas_width,
-                font=delivered_font,
-                scale=bubble_scale,
+        col_a, col_b = st.columns(2)
+        with col_a:
+            global_x = st.slider(
+                "Move all (X)", min_value=-W // 2, max_value=W // 2, value=0,
+            )
+        with col_b:
+            global_y = st.slider(
+                "Move all (Y)", min_value=0, max_value=H, value=int(H * 0.30),
+                help="Vertical position of the first bubble (px from top).",
             )
 
-    # Preview
-    st.image(base, use_container_width=True, caption="Preview")
-
-    # Download
-    out_format = st.radio(
-        "Download format",
-        options=["PNG", "JPG"],
-        horizontal=True,
-        key="imsg_dl_format",
-    )
-
-    buf = io.BytesIO()
-    if out_format == "PNG":
-        base.save(buf, format="PNG", optimize=True)
-        mime = "image/png"
-        ext = "png"
-    else:
-        base.convert("RGB").save(
-            buf, format="JPEG", quality=100, subsampling=0, optimize=True
+        bubble_gap = st.slider(
+            "Gap between messages (px)",
+            min_value=0, max_value=80, value=int(font_size * 0.45),
         )
-        mime = "image/jpeg"
-        ext = "jpg"
 
-    st.download_button(
-        label=f"⬇️  Download as {out_format}",
-        data=buf.getvalue(),
-        file_name=f"imessage_overlay.{ext}",
-        mime=mime,
-        type="primary",
-        use_container_width=True,
-    )
+        show_delivered = st.checkbox(
+            "Show 'Delivered' under the last sent message", value=True,
+        )
+
+        st.divider()
+
+        st.markdown("### Messages")
+        st.caption("Edit text, swap side, reorder, and nudge position per bubble.")
+
+        msgs = st.session_state.imsg_messages
+        to_delete = None
+
+        for i, m in enumerate(msgs):
+            label_side = "🟦 sent" if m["side"] == "right" else "⬜ received"
+            preview_text = m["text"][:30] + ("…" if len(m["text"]) > 30 else "")
+            with st.expander(f"#{i + 1} — {label_side} — \"{preview_text}\""):
+                m["text"] = st.text_area(
+                    "Text", value=m["text"], key=f"text_{i}", height=70,
+                )
+                m["side"] = st.radio(
+                    "Side",
+                    options=["left", "right"],
+                    format_func=lambda s: "Received (gray, left)" if s == "left"
+                                          else "Sent (blue, right)",
+                    horizontal=True,
+                    index=0 if m["side"] == "left" else 1,
+                    key=f"side_{i}",
+                )
+                cx, cy = st.columns(2)
+                with cx:
+                    m["dx"] = st.slider(
+                        "Nudge X (px)",
+                        min_value=-W // 2, max_value=W // 2,
+                        value=int(m.get("dx", 0)),
+                        key=f"dx_{i}",
+                    )
+                with cy:
+                    m["dy"] = st.slider(
+                        "Nudge Y (px)",
+                        min_value=-H // 2, max_value=H // 2,
+                        value=int(m.get("dy", 0)),
+                        key=f"dy_{i}",
+                    )
+                btn_cols = st.columns(4)
+                with btn_cols[0]:
+                    if st.button("⬆ Up", key=f"up_{i}", disabled=(i == 0),
+                                 use_container_width=True):
+                        msgs[i - 1], msgs[i] = msgs[i], msgs[i - 1]
+                        st.rerun()
+                with btn_cols[1]:
+                    if st.button("⬇ Down", key=f"down_{i}",
+                                 disabled=(i == len(msgs) - 1),
+                                 use_container_width=True):
+                        msgs[i + 1], msgs[i] = msgs[i], msgs[i + 1]
+                        st.rerun()
+                with btn_cols[2]:
+                    if st.button("Reset nudge", key=f"reset_{i}",
+                                 use_container_width=True):
+                        m["dx"] = 0
+                        m["dy"] = 0
+                        st.rerun()
+                with btn_cols[3]:
+                    if st.button("🗑 Delete", key=f"del_{i}",
+                                 use_container_width=True):
+                        to_delete = i
+
+        if to_delete is not None:
+            msgs.pop(to_delete)
+            st.rerun()
+
+        add_cols = st.columns(2)
+        with add_cols[0]:
+            if st.button("➕ Add received (gray)", use_container_width=True):
+                msgs.append({"side": "left", "text": "New message", "dx": 0, "dy": 0})
+                st.rerun()
+        with add_cols[1]:
+            if st.button("➕ Add sent (blue)", use_container_width=True,
+                         type="primary"):
+                msgs.append({"side": "right", "text": "New message", "dx": 0, "dy": 0})
+                st.rerun()
+
+    # ============== RIGHT — preview ========================================
+    with right_col:
+        st.markdown("### Preview")
+
+        if not st.session_state.imsg_messages:
+            st.warning("Add at least one message.")
+            return
+
+        base = base_preview.copy()
+        font = get_imessage_font(font_size)
+        delivered_font = get_imessage_font(max(10, int(font_size * 0.55)))
+
+        cursor_y = global_y
+        last_right_info: Tuple[int, int] | None = None
+
+        for m in st.session_state.imsg_messages:
+            if not m["text"].strip():
+                continue
+            top_y = cursor_y + m.get("dy", 0)
+            bottom_y, bx2, by2 = _draw_bubble(
+                base,
+                m["text"],
+                side=m["side"],
+                top_y=top_y,
+                x_offset=global_x + m.get("dx", 0),
+                canvas_width=W,
+                font=font,
+            )
+            if m["side"] == "right":
+                last_right_info = (by2, bx2)
+            # Cursor advances by natural height + gap (independent of dy nudges)
+            cursor_y = bottom_y - m.get("dy", 0) + bubble_gap
+
+        if (
+            show_delivered
+            and last_right_info is not None
+            and st.session_state.imsg_messages[-1]["side"] == "right"
+        ):
+            _draw_delivered(
+                base,
+                bottom_y=last_right_info[0],
+                right_edge=last_right_info[1],
+                font=delivered_font,
+            )
+
+        st.image(base, use_container_width=True)
+
+        st.divider()
+
+        out_format = st.radio(
+            "Download format",
+            options=["PNG", "JPG"],
+            horizontal=True,
+            key="imsg_dl_format",
+        )
+
+        buf = io.BytesIO()
+        if out_format == "PNG":
+            base.save(buf, format="PNG", optimize=True)
+            mime = "image/png"
+            ext = "png"
+        else:
+            base.convert("RGB").save(
+                buf, format="JPEG", quality=100, subsampling=0, optimize=True
+            )
+            mime = "image/jpeg"
+            ext = "jpg"
+
+        st.download_button(
+            label=f"⬇️  Download as {out_format}",
+            data=buf.getvalue(),
+            file_name=f"imessage_overlay.{ext}",
+            mime=mime,
+            type="primary",
+            use_container_width=True,
+        )
 
 
 # --------------------------------------------------------------------------- #
